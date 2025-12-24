@@ -297,7 +297,7 @@ class ChunkFormerModel(PreTrainedModel):
 
         # Load audio
         if audio_bytes:
-            audio = AudioSegment.from_wav(io.BytesIO("", audio_bytes))
+            audio = AudioSegment.from_wav(io.BytesIO(audio_bytes))
         else:
             audio = AudioSegment.from_file(audio_path)
         audio = audio.set_frame_rate(sample_rate)
@@ -516,7 +516,7 @@ class ChunkFormerModel(PreTrainedModel):
         rel_right_context_size = rel_right_context_size * subsampling_factor
 
         # Load audio and extract features using config parameters
-        xs, xs_len = self._load_audio_and_extract_features(audio_bytes = audio_bytes)
+        xs, xs_len = self._load_audio_and_extract_features(audio_path = "dummy_path", audio_bytes = audio_bytes) # temp fix
         xs = xs.unsqueeze(0)
         offset = torch.zeros(1, dtype=torch.int, device=device)
 
