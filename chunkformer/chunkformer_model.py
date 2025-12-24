@@ -274,7 +274,7 @@ class ChunkFormerModel(PreTrainedModel):
         xs_lens = xs_masks.squeeze(1).sum(-1)
         return xs, xs_lens
 
-    def _load_audio_and_extract_features(self, audio_path: str, audio_bytes = None):
+    def _load_audio_and_extract_features(self, audio_path: Optional[str] = None, audio_bytes: Optional[Union[bytes, io.BytesIO]] = None):
         """
         Load audio file and extract fbank features using config parameters.
 
@@ -284,6 +284,9 @@ class ChunkFormerModel(PreTrainedModel):
         Returns:
             torch.Tensor: Fbank features tensor
         """
+
+        assert (audio_path is not None) ^ (audio_bytes is not None), "Provide exactly one of `audio_path` or `audio_bytes`"
+
         # Get config parameters with defaults
         fbank_conf = getattr(self.config, "fbank_conf", {})
         resample_conf = getattr(self.config, "resample_conf", {})
@@ -297,7 +300,7 @@ class ChunkFormerModel(PreTrainedModel):
 
         # Load audio
         if audio_bytes:
-            audio = AudioSegment.from_wav(io.BytesIO(audio_bytes))
+            audio = AudioSegment.from_wav((audio_bytes.seek(0) or audio_bytes) if isinstance(audio_bytes, io.BytesIO) else io.BytesIO(audio_bytes))
         else:
             audio = AudioSegment.from_file(audio_path)
         audio = audio.set_frame_rate(sample_rate)
@@ -324,8 +327,8 @@ class ChunkFormerModel(PreTrainedModel):
     @torch.no_grad()
     def endless_decode(
         self,
-        audio_path: str,
-        audio_bytes: Optional[io.BytesIO] = None,
+        audio_path: Optional[str] = None,
+        audio_bytes: Optional[Union[bytes, io.BytesIO]] = None,
         chunk_size: Optional[int] = 64,
         left_context_size: Optional[int] = 128,
         right_context_size: Optional[int] = 128,
@@ -345,6 +348,8 @@ class ChunkFormerModel(PreTrainedModel):
             return_timestamps: Whether to return timestamps
             max_silence_duration: Maximum silence duration in seconds for sentence break detection
         """
+
+        assert (audio_path is not None) ^ (audio_bytes is not None), "Provide exactly one of `audio_path` or `audio_bytes`"
 
         def get_max_input_context(c, r, n):
             return r + max(c, r) * (n - 1)
@@ -377,9 +382,9 @@ class ChunkFormerModel(PreTrainedModel):
 
         # Load audio and extract features using config parameters
         if audio_bytes:
-            xs, xs_len = self._load_audio_and_extract_features(audio_path = "dummy", audio_bytes = audio_bytes) # temp fix thoi 
-        else:
-            xs, xs_len = self._load_audio_and_extract_features(audio_path)
+            xs, xs_len = self._load_audio_and_extract_features(audio_bytes = audio_bytes)
+        elif audio_path:
+            xs, xs_len = self._load_audio_and_extract_features(audio_path = audio_path)
         xs = xs.unsqueeze(0)
         offset = torch.zeros(1, dtype=torch.int, device=device)
 
