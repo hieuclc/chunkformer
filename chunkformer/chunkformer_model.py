@@ -7,6 +7,7 @@ import json
 import os
 from contextlib import nullcontext
 from typing import List, Optional, Union
+import io
 
 import jiwer
 import pandas as pd
@@ -273,7 +274,7 @@ class ChunkFormerModel(PreTrainedModel):
         xs_lens = xs_masks.squeeze(1).sum(-1)
         return xs, xs_lens
 
-    def _load_audio_and_extract_features(self, audio_path: str):
+    def _load_audio_and_extract_features(self, audio_path: str, audio_bytes = None):
         """
         Load audio file and extract fbank features using config parameters.
 
@@ -295,7 +296,10 @@ class ChunkFormerModel(PreTrainedModel):
         dither = 0.0
 
         # Load audio
-        audio = AudioSegment.from_file(audio_path)
+        if audio_bytes:
+            audio = AudioSegment.from_wav(io.BytesIO("", audio_bytes))
+        else:
+            audio = AudioSegment.from_file(audio_path)
         audio = audio.set_frame_rate(sample_rate)
         audio = audio.set_sample_width(2)  # set bit depth to 16bit
         audio = audio.set_channels(1)  # set to mono
@@ -372,6 +376,147 @@ class ChunkFormerModel(PreTrainedModel):
 
         # Load audio and extract features using config parameters
         xs, xs_len = self._load_audio_and_extract_features(audio_path)
+        xs = xs.unsqueeze(0)
+        offset = torch.zeros(1, dtype=torch.int, device=device)
+
+        encoder_outs = []
+        att_cache = torch.zeros(
+            (
+                self.model.encoder.num_blocks,
+                left_context_size,
+                self.model.encoder.attention_heads,
+                self.model.encoder._output_size * 2 // self.model.encoder.attention_heads,
+            )
+        ).to(device)
+        cnn_cache = torch.zeros(
+            (self.model.encoder.num_blocks, self.model.encoder._output_size, conv_lorder)
+        ).to(device)
+
+        for idx, _ in tqdm(
+            list(enumerate(range(0, xs_len, truncated_context_size * subsampling_factor)))
+        ):
+            start = max(truncated_context_size * subsampling_factor * idx, 0)
+            end = min(truncated_context_size * subsampling_factor * (idx + 1) + 7, xs_len)
+
+            x = xs[:, start : end + rel_right_context_size]
+            x_len = torch.tensor([x[0].shape[0]], dtype=torch.int).to(device)
+
+            (
+                encoder_out,
+                encoder_len,
+                _,
+                att_cache,
+                cnn_cache,
+                offset,
+            ) = self.model.encoder.forward_parallel_chunk(
+                xs=[x.squeeze(0)],
+                xs_origin_lens=x_len,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                right_context_size=right_context_size,
+                att_cache=att_cache,
+                cnn_cache=cnn_cache,
+                truncated_context_size=truncated_context_size,
+                offset=offset,
+            )
+
+            encoder_out = encoder_out.reshape(1, -1, encoder_out.shape[-1])[:, :encoder_len]
+            if chunk_size * multiply_n * subsampling_factor * idx + rel_right_context_size < xs_len:
+                encoder_out = encoder_out[
+                    :, :truncated_context_size
+                ]  # exclude the output of rel right context
+            offset = offset - encoder_len + encoder_out.shape[1]
+
+            encoder_outs.append(encoder_out)
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if (
+                chunk_size * multiply_n * subsampling_factor * idx + rel_right_context_size
+                >= xs_len
+            ):
+                break
+        encoder_outs = torch.cat(encoder_outs, dim=1)  # [1, T, F]  # type: ignore[assignment]
+        if self.config.model == "asr_model":
+            token_predictions = self.model.ctc.log_softmax(encoder_outs).squeeze(0)  # [1, T, V]
+            token_predictions = torch.argmax(token_predictions, dim=-1).reshape(1, -1, 1)
+        else:
+            encoder_len = torch.tensor(
+                [encoder_outs.shape[1]], device=encoder_outs.device  # type: ignore[attr-defined]
+            )
+            token_predictions = optimized_search(
+                self.model, encoder_out=encoder_outs, encoder_out_lens=encoder_len
+            )
+            token_predictions = token_predictions.reshape(
+                1, encoder_outs.size(1), -1  # type: ignore[attr-defined]
+            )
+
+        if self.char_dict is not None:
+            decode_result = get_output_with_timestamps(
+                token_predictions, self.char_dict, self.config.model, max_silence_duration
+            )[0]
+            if not return_timestamps:
+                decode_result = " ".join([item["decode"] for item in decode_result]).strip()
+        else:
+            decode_result = token_predictions
+
+        return decode_result
+
+    @torch.no_grad()
+    def bytes_decode(
+        self,
+        audio_bytes,
+        chunk_size: Optional[int] = 64,
+        left_context_size: Optional[int] = 128,
+        right_context_size: Optional[int] = 128,
+        total_batch_duration: int = 1800,
+        return_timestamps: bool = True,
+        max_silence_duration: float = 0.5,
+    ):
+        """
+        Perform streaming/endless decoding on long-form audio.
+
+        Args:
+            audio_path: Path to audio file
+            chunk_size: Chunk size for processing
+            left_context_size: Left context size
+            right_context_size: Right context size
+            total_batch_duration: Total duration in seconds for batch processing
+            return_timestamps: Whether to return timestamps
+            max_silence_duration: Maximum silence duration in seconds for sentence break detection
+        """
+
+        def get_max_input_context(c, r, n):
+            return r + max(c, r) * (n - 1)
+
+        device = next(self.parameters()).device
+
+        # Use config defaults if not provided
+        chunk_size = chunk_size if chunk_size is not None else 64
+        left_context_size = left_context_size if left_context_size is not None else 128
+        right_context_size = right_context_size if right_context_size is not None else 128
+
+        # Model configuration
+        subsampling_factor = self.model.encoder.embed.subsampling_rate
+        conv_lorder = self.model.encoder.cnn_module_kernel // 2
+
+        # Get the maximum length that the gpu can consume
+        max_length_limited_context = total_batch_duration
+        max_length_limited_context = (
+            int((max_length_limited_context // 0.01)) // 2
+        )  # in 10ms second
+
+        multiply_n = max_length_limited_context // chunk_size // subsampling_factor
+        truncated_context_size = chunk_size * multiply_n  # we only keep this part for text decoding
+
+        # Get the relative right context size
+        rel_right_context_size = get_max_input_context(
+            chunk_size, max(right_context_size, conv_lorder), self.model.encoder.num_blocks
+        )
+        rel_right_context_size = rel_right_context_size * subsampling_factor
+
+        # Load audio and extract features using config parameters
+        xs, xs_len = self._load_audio_and_extract_features(audio_bytes = audio_bytes)
         xs = xs.unsqueeze(0)
         offset = torch.zeros(1, dtype=torch.int, device=device)
 
